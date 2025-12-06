@@ -26,14 +26,14 @@ fn test() {
     let t2 = 30e-3;
     let m0 = 1.;
     let ppm = 1.;
-    let rf_scale = 5e-3;
+    let rf_scale = 1e-5;
 
     let mut spins = Isochromats::uniform(gamma,t1,t2,m0,positions.len());
     let offres = OffResonance::uniform(ppm,positions.len());
     let tx = TxSensitivity::uniform(rf_scale,positions.len());
     let rx = RxSensitivity::uniform(positions.len());
 
-    let mut f = File::open("/Users/Wyatt/seq-lib/rf_cal.ps").unwrap();
+    let mut f = File::open("C:/Users/waust/seq-lib/rf_cal.ps").unwrap();
     let mut file_contents = vec![];
     f.read_to_end(&mut file_contents).unwrap();
     assert_eq!(file_contents.len() % 8, 0, "Length must be multiple of 8");
@@ -117,9 +117,9 @@ impl Positions {
                 for _z in -n..=n {
                     let r = _x*_x + _y*_y + _z*_z;
                     if r as f64 * spacing_mm <= radius_mm {
-                        x.push(_x as f64);
-                        y.push(_y as f64);
-                        z.push(_z as f64);
+                        x.push(_x as f64 * spacing_mm * 1e-3);
+                        y.push(_y as f64 * spacing_mm * 1e-3);
+                        z.push(_z as f64 * spacing_mm * 1e-3);
                     }
                 }
             }
