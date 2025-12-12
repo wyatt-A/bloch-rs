@@ -1,9 +1,15 @@
+use std::f64::consts::PI;
 use std::io::Write;
 use std::fs::File;
 use std::io::Read;
+use std::path::Path;
 use bytemuck::cast_slice;
 use num_complex::{Complex, Complex64, ComplexFloat};
-use crate::operators::{apply_relaxation, apply_rotation, relaxation_operator, rotation_operator};
+use rand::distr::Distribution;
+use rand::rng;
+use rand_distr::Normal;
+use rand_distr::num_traits::abs_sub;
+use crate::operators::{apply_relax, apply_rotation, compute_relax_coeffs, compute_rotation_coeffs};
 use rayon::prelude::*;
 pub mod operators;
 
@@ -20,20 +26,19 @@ fn test() {
     let positions = Positions::sphere(10.,0.1);
     println!("generated {} spins",positions.len());
 
-    let cf_hz = 300e6;
-    let gamma = 42.58e6;
+    let gamma = 42.58e6 * 2. * PI;
     let t1 = 100e-3;
     let t2 = 30e-3;
     let m0 = 1.;
-    let ppm = 1.;
-    let rf_scale = 1e-5;
+    let ppm = 7.0 * 2e-6; // ppm in tesla
+    let rf_scale = 8e-6;
 
     let mut spins = Isochromats::uniform(gamma,t1,t2,m0,positions.len());
-    let offres = OffResonance::uniform(ppm,positions.len());
+    let offres = OffResonance::normal_dist(ppm,positions.len());
     let tx = TxSensitivity::uniform(rf_scale,positions.len());
     let rx = RxSensitivity::uniform(positions.len());
 
-    let mut f = File::open("C:/Users/waust/seq-lib/rf_cal.ps").unwrap();
+    let mut f = File::open("C:/Users/waust/seq-lib/output.ps").unwrap();
     let mut file_contents = vec![];
     f.read_to_end(&mut file_contents).unwrap();
     assert_eq!(file_contents.len() % 8, 0, "Length must be multiple of 8");
@@ -76,7 +81,6 @@ fn test() {
             rf_i,
             acq,
             tau,
-            cf_hz
         );
     });
 
@@ -99,6 +103,29 @@ pub struct Positions {
 }
 
 impl Positions {
+
+    pub fn from_file(file:impl AsRef<Path>) -> Positions {
+        let mut f = File::open(file.as_ref()).unwrap();
+        let mut bytes = vec![];
+        f.read_to_end(&mut bytes).unwrap();
+        // number of 8-byte values should be divisible by 7
+        assert_eq!(bytes.len() % (8*3), 0);
+        let data:&[f64] = cast_slice(&bytes);
+        let n = data.len() / 3;
+        let chunks:Vec<_> = data.chunks_exact(n).collect();
+        Positions {
+            x: chunks[0].to_vec(),
+            y: chunks[1].to_vec(),
+            z: chunks[2].to_vec(),
+        }
+    }
+
+    pub fn to_file(&self,file:impl AsRef<Path>) {
+        let mut f = File::create(file.as_ref()).unwrap();
+        f.write_all(cast_slice(self.x.as_slice())).unwrap();
+        f.write_all(cast_slice(self.y.as_slice())).unwrap();
+        f.write_all(cast_slice(self.z.as_slice())).unwrap();
+    }
 
     pub fn len(&self) -> usize {
         self.x.len()
@@ -138,16 +165,52 @@ impl Positions {
 
 
 pub struct Isochromats {
-    gamma:Vec<f64>,
-    m0:Vec<f64>,
     mx:Vec<f64>,
     my:Vec<f64>,
     mz:Vec<f64>,
+    gamma:Vec<f64>,
+    m0:Vec<f64>,
     t1:Vec<f64>,
     t2:Vec<f64>,
 }
 
 impl Isochromats {
+
+    pub fn from_file(file:impl AsRef<Path>) -> Isochromats {
+        let mut f = File::open(file.as_ref()).unwrap();
+        let mut bytes = vec![];
+        f.read_to_end(&mut bytes).unwrap();
+        // number of 8-byte values should be divisible by 7
+        assert_eq!(bytes.len() % (8*7), 0);
+        let data:&[f64] = cast_slice(&bytes);
+        let n = data.len() / 7;
+        let chunks:Vec<_> = data.chunks_exact(n).collect();
+        Isochromats {
+            mx: chunks[0].to_vec(),
+            my: chunks[1].to_vec(),
+            mz: chunks[2].to_vec(),
+            gamma: chunks[3].to_vec(),
+            m0: chunks[4].to_vec(),
+            t1: chunks[5].to_vec(),
+            t2: chunks[6].to_vec(),
+        }
+    }
+
+    pub fn to_file(&self,file:impl AsRef<Path>) {
+        let mut f = File::create(file.as_ref()).unwrap();
+        f.write_all(cast_slice(self.mx.as_slice())).unwrap();
+        f.write_all(cast_slice(self.my.as_slice())).unwrap();
+        f.write_all(cast_slice(self.mz.as_slice())).unwrap();
+        f.write_all(cast_slice(self.gamma.as_slice())).unwrap();
+        f.write_all(cast_slice(self.m0.as_slice())).unwrap();
+        f.write_all(cast_slice(self.t1.as_slice())).unwrap();
+        f.write_all(cast_slice(self.t2.as_slice())).unwrap();
+    }
+
+    pub fn len(&self) -> usize {
+        self.mx.len()
+    }
+
     pub fn uniform(gamma:f64,t1:f64,t2:f64,m0:f64,n:usize) -> Isochromats {
         Isochromats {
             gamma:vec![gamma;n],
@@ -167,9 +230,54 @@ pub struct OffResonance {
 }
 
 impl OffResonance {
-    pub fn uniform(ppm: f64, n:usize) -> OffResonance {
+
+    pub fn len(&self) -> usize {
+        self.db0.len()
+    }
+
+    pub fn from_file(file:impl AsRef<Path>) -> OffResonance {
+        let mut f = File::open(file.as_ref()).unwrap();
+        let mut bytes = vec![];
+        f.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes.len() % 8, 0);
+        let values:&[f64] = cast_slice(&bytes);
         OffResonance {
-            db0:vec![ppm * 1e-6;n]
+            db0: values.to_vec()
+        }
+    }
+
+    pub fn to_file(&self,file:impl AsRef<Path>) {
+        let mut f = File::create(file.as_ref()).unwrap();
+        f.write_all(cast_slice(self.db0.as_slice())).unwrap();
+    }
+
+    pub fn uniform(tesla: f64, n:usize) -> OffResonance {
+        OffResonance {
+            db0:vec![tesla;n]
+        }
+    }
+
+    pub fn normal_dist(tesla_std: f64, n:usize) -> OffResonance {
+
+        let normal = Normal::new(0.0, tesla_std).unwrap();
+        let mut rng = rng();
+
+        // Generate a single Gaussian f64
+
+        // Generate a vector of Gaussian samples
+        let samples: Vec<f64> = (0..n)
+            .map(|_| {
+                let val = normal.sample(&mut rng);
+                if val == 0.0 {
+                    f64::EPSILON
+                }else {
+                    val
+                }
+            } )
+            .collect();
+
+        OffResonance {
+            db0:samples
         }
     }
 }
@@ -180,6 +288,34 @@ pub struct TxSensitivity {
 }
 
 impl TxSensitivity {
+
+    pub fn scale(self,rf_scale_tesla:f64) -> Self {
+        let c = self.c.into_par_iter().map(|x| x * rf_scale_tesla).collect();
+        Self {
+            c
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.c.len()
+    }
+
+    pub fn from_file(file:impl AsRef<Path>) -> TxSensitivity {
+        let mut f = File::open(file.as_ref()).unwrap();
+        let mut bytes = vec![];
+        f.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes.len() % 8, 0);
+        let values:&[f64] = cast_slice(&bytes);
+        TxSensitivity {
+            c: values.to_vec()
+        }
+    }
+
+    pub fn to_file(&self,file:impl AsRef<Path>) {
+        let mut f = File::create(file.as_ref()).unwrap();
+        f.write_all(cast_slice(self.c.as_slice())).unwrap();
+    }
+
     pub fn uniform(scale_t:f64,n:usize) -> TxSensitivity {
         TxSensitivity {
             c:vec![scale_t;n],
@@ -193,6 +329,27 @@ pub struct RxSensitivity {
 }
 
 impl RxSensitivity {
+
+    pub fn len(&self) -> usize {
+        self.c.len()
+    }
+
+    pub fn from_file(file:impl AsRef<Path>) -> RxSensitivity {
+        let mut f = File::open(file.as_ref()).unwrap();
+        let mut bytes = vec![];
+        f.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes.len() % 8, 0);
+        let values:&[f64] = cast_slice(&bytes);
+        RxSensitivity {
+            c: values.to_vec()
+        }
+    }
+
+    pub fn to_file(&self,file:impl AsRef<Path>) {
+        let mut f = File::create(file.as_ref()).unwrap();
+        f.write_all(cast_slice(self.c.as_slice())).unwrap();
+    }
+
     pub fn uniform(n:usize) -> RxSensitivity {
         RxSensitivity {
             c:vec![1.;n],
@@ -200,7 +357,7 @@ impl RxSensitivity {
     }
 }
 
-pub fn update(signal:&mut Vec<Complex<f64>>, isochromats:&mut Isochromats, positions:&Positions, tx:&TxSensitivity, rx:&RxSensitivity, offres:&OffResonance, gx:f64, gy:f64, gz:f64, rf_r:f64, rf_i:f64, acq:f64, tau:f64, cf_hz:f64 ) {
+pub fn update(signal:&mut Vec<Complex<f64>>, isochromats:&mut Isochromats, positions:&Positions, tx:&TxSensitivity, rx:&RxSensitivity, offres:&OffResonance, gx:f64, gy:f64, gz:f64, rf_r:f64, rf_i:f64, acq:f64, tau:f64 ) {
 
 
     //println!("g = [{gx},{gy},{gz}]");
@@ -237,41 +394,35 @@ pub fn update(signal:&mut Vec<Complex<f64>>, isochromats:&mut Isochromats, posit
         .zip(tx.c.par_iter())
         .for_each(|(((((((((((mx,my),mz),&x),&y),&z),&m0),&t1),&t2),&gamma),&db0),&c)| {
 
-        let bx = c * rf_r;
-        let by = c * rf_i;
-        let bz = gx * x + gy * y + gz * z + (cf_hz * db0 / gamma);
+            let bx = c * rf_r;
+            let by = c * rf_i;
+            let relax_coeffs = compute_relax_coeffs(t1, t2, m0, tau/2.);
 
-        // half step for strang splitting
-        let rel_op = relaxation_operator(t1, t2, tau/2.);
+            // half-step relax
+            apply_relax(
+                mx,
+                my,
+                mz,
+                &relax_coeffs
+            );
 
-        // full step
-        let rot_op = rotation_operator(bx, by, bz, tau, gamma);
+            // full step rotation
+            if let Some(rot_coeffs) = compute_rotation_coeffs(x, y, z, gx, gy, gz, bx, by, db0, gamma, tau) {
+                apply_rotation(
+                    mx,
+                    my,
+                    mz,
+                    &rot_coeffs
+                );
+            }
 
-        // half-step relax
-        apply_relaxation(
-            mx,
-            my,
-            mz,
-            m0,
-            &rel_op
-        );
-
-        // full step rotation
-        apply_rotation(
-            mx,
-            my,
-            mz,
-            &rot_op
-        );
-
-        // half-step relax
-        apply_relaxation(
-            mx,
-            my,
-            mz,
-            m0,
-            &rel_op
-        );
+            // half-step relax
+            apply_relax(
+                mx,
+                my,
+                mz,
+                &relax_coeffs
+            );
 
     });
 
